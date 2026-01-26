@@ -224,6 +224,8 @@ class VoCoTrainer(AbstractBaseTrainer):
             num_output_channels,
             encoder_only=True,
         )
+        if encoder is None:
+            raise RuntimeError("Encoder is None! check get_network_by_name")
         architecture = VoCoArchitecture(encoder, encoder.output_channels)
 
         # We need to set the patch size to the one the model saw during training

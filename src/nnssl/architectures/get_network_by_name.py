@@ -69,6 +69,8 @@ def get_network_by_name(
         if architecture_name in ["ResEncL", "NoSkipResEncL"]:
             model: ResidualEncoderUNet
             try:
+                if model.encoder is None:
+                    raise RuntimeError("model.encoder is None")
                 model = model.encoder
                 model.key_to_encoder = model.key_to_encoder.replace("encoder.", "")
                 model.keys_to_in_proj = [k.replace("encoder.", "") for k in model.keys_to_in_proj]
@@ -76,4 +78,9 @@ def get_network_by_name(
                 raise RuntimeError("Trying to get the 'encoder' of the network failed. Cannot return encoder only.")
         elif architecture_name in ["PrimusS", "PrimusB", "PrimusM", "PrimusL"]:
             raise NotImplementedError("Cannot return encoder only for Primus architectures.")
+
+    if model is None:
+        raise RuntimeError(
+            f"get_network_by_name: model is None before return. architecture_name={architecture_name}, encoder_only={encoder_only}"
+        )
     return model
