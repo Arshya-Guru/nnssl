@@ -80,3 +80,6 @@ def get_network_by_name(
                 model.keys_to_in_proj = [k.replace("encoder.", "") for k in keys_to_in_proj] if keys_to_in_proj else []
             except AttributeError:
                 raise RuntimeError("Trying to get the 'encoder' of the network failed. Cannot return encoder only.")
+        elif architecture_name in ["PrimusS", "PrimusB", "PrimusM", "PrimusL"]:
+            raise NotImplementedError("Cannot return encoder only for Primus architectures.")
+    return model
