@@ -41,8 +41,8 @@ class VoCoTrainer(AbstractBaseTrainer):
         fold: int,
         pretrain_json: dict,
         device: torch.device = torch.device("cuda"),
-        patch_size: tuple = (256, 256, 64),
-        base_crop_count: tuple = (4, 4, 1),
+        patch_size: tuple = (256, 256, 256),
+        base_crop_count: tuple = (4, 4, 4),
         target_crop_count: int = 4,
     ):
         # plan.configurations[configuration_name].patch_size = (192, 192, 64)
