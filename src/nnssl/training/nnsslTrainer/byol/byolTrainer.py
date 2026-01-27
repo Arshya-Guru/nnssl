@@ -567,6 +567,8 @@ class BYOLTrainer(AbstractBaseTrainer):
         
         return architecture, adapt_plan
     
+# Cell: Replace train_step method (around line 580)
+
     def train_step(self, batch: dict) -> dict:
         """Single training step for BYOL."""
         all_views = batch["all_views"]
@@ -580,14 +582,17 @@ class BYOLTrainer(AbstractBaseTrainer):
         
         self.optimizer.zero_grad(set_to_none=True)
         
+        # Get underlying model (handles DDP wrapper)
+        model = self.network.module if hasattr(self.network, 'module') else self.network
+        
         with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
             # Online network forward (with predictor)
-            online_pred_1 = self.network.forward_online(view1)
-            online_pred_2 = self.network.forward_online(view2)
+            online_pred_1 = model.forward_online(view1)
+            online_pred_2 = model.forward_online(view2)
             
             # Target network forward (no predictor, no gradients)
-            target_proj_1 = self.network.forward_target(view1)
-            target_proj_2 = self.network.forward_target(view2)
+            target_proj_1 = model.forward_target(view1)
+            target_proj_2 = model.forward_target(view2)
             
             # BYOL loss (symmetric)
             loss = self.loss(online_pred_1, online_pred_2, target_proj_1, target_proj_2)
@@ -605,11 +610,11 @@ class BYOLTrainer(AbstractBaseTrainer):
             self.optimizer.step()
         
         # Update target network with EMA
-        self.network.update_target_network(self.current_step, self.max_steps)
+        model.update_target_network(self.current_step, self.max_steps)
         self.current_step += 1
         
         return {"loss": loss.detach().cpu().numpy()}
-    
+
     def validation_step(self, batch: dict) -> dict:
         """Validation step for BYOL."""
         all_views = batch["all_views"]
@@ -620,12 +625,15 @@ class BYOLTrainer(AbstractBaseTrainer):
         view1 = all_views[:batch_size]
         view2 = all_views[batch_size:]
         
+        # Get underlying model (handles DDP wrapper)
+        model = self.network.module if hasattr(self.network, 'module') else self.network
+        
         with torch.no_grad():
             with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-                online_pred_1 = self.network.forward_online(view1)
-                online_pred_2 = self.network.forward_online(view2)
-                target_proj_1 = self.network.forward_target(view1)
-                target_proj_2 = self.network.forward_target(view2)
+                online_pred_1 = model.forward_online(view1)
+                online_pred_2 = model.forward_online(view2)
+                target_proj_1 = model.forward_target(view1)
+                target_proj_2 = model.forward_target(view2)
                 
                 loss = self.loss(online_pred_1, online_pred_2, target_proj_1, target_proj_2)
         
