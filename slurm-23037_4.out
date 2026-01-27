@@ -1,0 +1,4 @@
+Preprocessing dataset Dataset001_Pretrain
+Configuration: noresample...
+Preprocessing the following configuration: noresample
+ConfigurationPlan(data_identifier='nnsslPlans_noresample', preprocessor_name='DefaultPreprocessor', spacing_style='noresample', normalization_schemes=['ZScoreNormalization'], use_mask_for_norm=[False], resampling_fn_data='resample_data_or_seg_to_shape', resampling_fn_data_kwargs={'is_seg': False, 'order': 3, 'order_z': 0, 'force_separate_z': None}, resampling_fn_mask='resample_data_or_seg_to_shape', resampling_fn_mask_kwargs={'is_seg': True, 'order': 1, 'order_z': 0, 'force_separate_z': None}, spacing=None, patch_size=None)
