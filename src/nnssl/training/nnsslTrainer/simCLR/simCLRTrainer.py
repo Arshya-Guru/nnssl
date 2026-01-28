@@ -60,7 +60,7 @@ class SimCLRTrainer(AbstractBaseTrainer):
         fold: int,
         pretrain_json: dict,
         device: torch.device = torch.device("cuda"),
-        patch_size: tuple = (192, 192, 64),
+        patch_size: tuple = (256, 256, 256),
         crop_size: tuple = (64, 64, 64),
         num_crops_per_image: int = 2,
         min_crop_overlap: float = 0.5,
@@ -341,6 +341,20 @@ class SimCLRTrainer_BS32(SimCLRTrainer):
     ):
         super().__init__(plan, configuration_name, fold, pretrain_json, device)
         self.total_batch_size = 32
+
+
+class SimCLRTrainer_BS64(SimCLRTrainer):
+    def __init__(
+        self,
+        plan: Plan,
+        configuration_name: str,
+        fold: int,
+        pretrain_json: dict,
+        device: torch.device = torch.device("cuda"),
+    ):
+        super().__init__(plan, configuration_name, fold, pretrain_json, device)
+        self.total_batch_size = 64
+
 
 class SimCLRTrainer_BS8_256iso(SimCLRTrainer):
     """SimCLR for 256³ isotropic LSFM data"""
