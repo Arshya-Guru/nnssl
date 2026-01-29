@@ -31,7 +31,10 @@ keywords = [
 ]
 dependencies = [
     "torch>=2.0.0",
+    "pytorch-lightning<2.0.0",
+    "torchmetrics<0.11.0",
     "acvl-utils>=0.2",
+    "typing_extensions",
     "dynamic-network-architectures @ git+https://github.com/TaWald/dynamic-network-architectures@main",
     "tqdm",
     "dicom2nifti",

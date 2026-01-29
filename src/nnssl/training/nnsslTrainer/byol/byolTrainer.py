@@ -236,16 +236,7 @@ class BYOLTransform(AbstractTransform):
     """
     BYOL augmentation with random crops and asymmetric augmentation.
     
-    Key fixes:Critical DDP Risk: The "Split-Brain" Target Network
-Claude's code initializes the target network using deepcopy(encoder) inside __init__.
-
-The Bug: In PyTorch DDP, the DDP(...) wrapper only synchronizes parameters where requires_grad=True at the start of training. The target network parameters are frozen (requires_grad=False).
-
-The Consequence: When you launch training on 2 GPUs, GPU_0 and GPU_1 will initialize their encoders with different random seeds. DDP will sync the online network, but the target networks will remain different on every GPU.
-
-The Result: Your GPUs are training against different targets. The EMA update will propagate these differences indefinitely. This effectively creates "split-brain" training that degrades representation quality.
-
-The Fix: You must manually broadcast the target network weights from Rank 0 to all other ranks during initialize().
+    Key fixes:
     - Random 3D crops from larger patches
     - ASYMMETRIC blur/solarization between views (per BYOL paper)
     - Fixed np.random.choice bug for rotation axes
@@ -486,6 +477,86 @@ class BYOLTrainer(AbstractBaseTrainer):
         
         self._collapse_warning_count = 0
     
+    def initialize(self):
+        """
+        Override to add DDP target network synchronization.
+        
+        CRITICAL FIX: DDP only syncs requires_grad=True params.
+        Target network has requires_grad=False, so we must manually
+        broadcast from rank 0 to all other ranks.
+        """
+        if not self.was_initialized:
+            self._set_batch_size()
+            
+            # Build network (this creates BYOLArchitecture with potentially divergent target networks)
+            self.network, self.adaptation_plan = self.build_architecture_and_adaptation_plan(
+                self.config_plan, self.num_input_channels, self.num_output_channels
+            )
+            save_json(self.adaptation_plan.serialize(), self.adaptation_json_plan)
+            self.network.to(self.device)
+            
+            # Verify adaptation plans
+            self.verify_adaptation_plans(
+                self.adaptation_plan.serialize(), self.configuration_name, self.network.state_dict()
+            )
+            
+            # Compile if enabled
+            if self._do_i_compile():
+                self.print_to_log_file("Using torch.compile...")
+                self.network = torch.compile(self.network)
+            
+            # Configure optimizer BEFORE DDP (as in parent)
+            self.optimizer, self.lr_scheduler = self.configure_optimizers()
+            
+            # ================================================================
+            # CRITICAL FIX: Sync target network BEFORE DDP wrapper
+            # ================================================================
+            if self.is_ddp:
+                self._sync_target_network_across_ranks()
+                
+                # Convert to SyncBatchNorm and wrap in DDP
+                self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
+                self.network = DDP(self.network, device_ids=[self.local_rank], find_unused_parameters=True)
+            
+            self.loss = self.build_loss()
+            self.was_initialized = True
+        else:
+            raise RuntimeError(
+                "You have called self.initialize even though the trainer was already initialized. "
+                "That should not happen."
+            )
+    
+    def _sync_target_network_across_ranks(self):
+        """
+        Broadcast target network weights from rank 0 to all other ranks.
+        
+        This fixes the "split-brain" problem where each GPU has different
+        target network weights because:
+        1. deepcopy(encoder) happens independently on each GPU
+        2. DDP only syncs requires_grad=True parameters
+        3. Target network has requires_grad=False
+        
+        Must be called BEFORE DDP wrapping but AFTER network.to(device).
+        """
+        self.print_to_log_file("Synchronizing target network across DDP ranks...")
+        
+        # Get the target encoder and projector parameters
+        target_params = list(self.network.target_encoder.parameters()) + \
+                       list(self.network.target_projector.parameters())
+        
+        # Broadcast each parameter from rank 0
+        for param in target_params:
+            dist.broadcast(param.data, src=0)
+        
+        # Verify sync worked (optional but helpful for debugging)
+        if dist.get_rank() == 0:
+            self.print_to_log_file(
+                f"Target network synced: {len(target_params)} parameter tensors broadcast from rank 0"
+            )
+        
+        # Barrier to ensure all ranks have received the broadcast
+        dist.barrier()
+
     # =========================================================================
     # FIX 2: Override configure_optimizers with AdamW + Cosine Annealing
     # =========================================================================
