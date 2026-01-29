@@ -832,6 +832,21 @@ class BYOLTrainer_BS8_256iso(BYOLTrainer):
         self.total_batch_size = 8
 
 
+class BYOLTrainer_BS8_256iso_96crop(BYOLTrainer):
+    """BYOL for 256³ patches → 128³ crops."""
+    def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
+        super().__init__(
+            plan, configuration_name, fold, pretrain_json, device,
+            patch_size=(256, 256, 256),
+            crop_size=(96, 96, 96),
+            min_overlap_ratio=0.2,
+            hidden_dim=4096,
+            projection_dim=256,
+            tau_base=0.996,
+        )
+        self.total_batch_size = 8
+
+
 class BYOLTrainer_BS16_256iso(BYOLTrainer):
     """BYOL with batch size 16."""
     def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
