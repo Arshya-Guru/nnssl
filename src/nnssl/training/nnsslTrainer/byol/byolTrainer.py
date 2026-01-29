@@ -12,8 +12,15 @@ Key features:
 3. Eager target network initialization
 4. Proper EMA updates
 
+Fixes from original buggy version:
+- No early return in update_target_network (was skipping first EMA update)
+- Consistent all_views format (no mixing with view1/view2)
+- Validation uses light augmentation (not zero)
+- DDP-safe model access via _get_network()
+- FIXED: np.random.choice bug in _apply_rotation
+
 To use: Replace your existing byolTrainer.py with this file
-Then run: nnssl_train 1 noresample -tr BYOLTrainer_BS8_256iso -p nnsslPlans -num_gpus 2
+Then run: nnssl_train 1 noresample -tr BYOLTrainer_BS16_256iso -p nnsslPlans -num_gpus 2
 """
 
 from copy import deepcopy
@@ -119,7 +126,7 @@ class BYOLArchitecture(nn.Module):
         self.online_projector = BYOLProjectionHead(total_features, hidden_dim, projection_dim)
         self.online_predictor = BYOLPredictorHead(projection_dim, hidden_dim, projection_dim)
         
-        # Target Network - EAGER initialization
+        # Target Network - EAGER initialization (not lazy!)
         self.target_encoder = deepcopy(encoder)
         self.target_projector = deepcopy(self.online_projector)
         
@@ -131,7 +138,11 @@ class BYOLArchitecture(nn.Module):
     
     @torch.no_grad()
     def update_target_network(self, current_step: int = None, max_steps: int = None):
-        """EMA update: ξ ← τξ + (1-τ)θ"""
+        """
+        EMA update: ξ ← τξ + (1-τ)θ
+        
+        NO early return - this was the bug that caused collapse!
+        """
         if current_step is not None and max_steps is not None and max_steps > 0:
             self.tau = 1 - (1 - self.tau_base) * (
                 math.cos(math.pi * current_step / max_steps) + 1
@@ -240,11 +251,6 @@ class BYOLTransform(AbstractTransform):
     - Gaussian blur (asymmetric)
     - Solarization/intensity inversion (asymmetric, view 2 only)
     - Gaussian noise
-    
-    Args:
-        patch_size: Input patch size (e.g., 256³)
-        crop_size: Output crop size (e.g., 128³)
-        min_overlap_ratio: Minimum overlap between two crops (default 0.2)
     """
     
     def __init__(
@@ -255,7 +261,7 @@ class BYOLTransform(AbstractTransform):
         # Shared augmentation probabilities
         p_flip: float = 0.5,
         p_rotation: float = 0.5,
-        # Intensity jitter (applied to both views with same probability)
+        # Intensity jitter
         p_intensity_jitter: float = 0.8,
         brightness_range: Tuple[float, float] = (0.6, 1.4),
         contrast_range: Tuple[float, float] = (0.6, 1.4),
@@ -267,7 +273,7 @@ class BYOLTransform(AbstractTransform):
         blur_sigma_range: Tuple[float, float] = (0.5, 2.0),
         p_blur_view1: float = 1.0,   # Mandatory for view 1
         p_blur_view2: float = 0.1,   # Optional for view 2
-        # Solarization (intensity inversion) - ASYMMETRIC  
+        # Solarization - ASYMMETRIC  
         p_solarization_view1: float = 0.0,  # Never for view 1
         p_solarization_view2: float = 0.2,  # Optional for view 2
         solarization_threshold: float = 0.5,
@@ -301,38 +307,30 @@ class BYOLTransform(AbstractTransform):
         
         # Compute valid crop range
         self.max_start = self.patch_size - self.crop_size
+        
+        # Pre-define rotation axis options (for 3D: rotate in xy, xz, or yz plane)
+        self._rotation_axes = [(1, 2), (1, 3), (2, 3)]
     
     def _get_random_crop_coords(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Generate two random crop coordinates with minimum overlap constraint.
-        
-        Returns:
-            start1, start2: Starting coordinates for both crops
-        """
+        """Generate two random crop coordinates with minimum overlap constraint."""
         # First crop: completely random
         start1 = np.array([
             np.random.randint(0, self.max_start[i] + 1) for i in range(3)
         ])
         
         # Second crop: constrained to have minimum overlap with first
-        # Overlap in each dimension must be at least min_overlap_ratio * crop_size
         min_overlap_voxels = (self.min_overlap_ratio * self.crop_size).astype(int)
         
-        # For overlap, start2 must be within [start1 - crop_size + min_overlap, start1 + crop_size - min_overlap]
-        # But also within valid range [0, max_start]
         start2 = np.zeros(3, dtype=int)
         for i in range(3):
-            # Range that guarantees minimum overlap
             low = max(0, start1[i] - self.crop_size[i] + min_overlap_voxels[i])
             high = min(self.max_start[i], start1[i] + self.crop_size[i] - min_overlap_voxels[i])
             
             if low > high:
-                # Fallback: just ensure some overlap
                 low = max(0, start1[i] - self.crop_size[i] // 2)
                 high = min(self.max_start[i], start1[i] + self.crop_size[i] // 2)
             
             if low > high:
-                # Edge case: use same start
                 start2[i] = start1[i]
             else:
                 start2[i] = np.random.randint(low, high + 1)
@@ -342,7 +340,7 @@ class BYOLTransform(AbstractTransform):
     def _extract_crop(self, volume: np.ndarray, start: np.ndarray) -> np.ndarray:
         """Extract a crop from the volume."""
         return volume[
-            :,  # Channel dimension
+            :,
             start[0]:start[0] + self.crop_size[0],
             start[1]:start[1] + self.crop_size[1],
             start[2]:start[2] + self.crop_size[2],
@@ -350,7 +348,7 @@ class BYOLTransform(AbstractTransform):
     
     def _apply_flip(self, volume: np.ndarray) -> np.ndarray:
         """Random flip along each spatial axis."""
-        for axis in [1, 2, 3]:  # D, H, W (skip channel)
+        for axis in [1, 2, 3]:
             if np.random.random() < self.p_flip:
                 volume = np.flip(volume, axis=axis)
         return volume.copy()
@@ -358,20 +356,18 @@ class BYOLTransform(AbstractTransform):
     def _apply_rotation(self, volume: np.ndarray) -> np.ndarray:
         """Random 90-degree rotation."""
         if np.random.random() < self.p_rotation:
-            k = np.random.choice([1, 2, 3])
-            axes = tuple(np.random.choice([[1, 2], [1, 3], [2, 3]]))
+            k = np.random.choice([1, 2, 3])  # 90, 180, or 270 degrees
+            # FIX: np.random.choice can't select from list of tuples
+            # Use randint to index into the list instead
+            axes = self._rotation_axes[np.random.randint(len(self._rotation_axes))]
             volume = np.rot90(volume, k=k, axes=axes)
         return volume.copy()
     
     def _apply_intensity_jitter(self, volume: np.ndarray) -> np.ndarray:
-        """
-        Apply intensity jitter (analog to color jitter for grayscale).
-        Applies brightness, contrast, and gamma in random order.
-        """
+        """Apply intensity jitter (brightness, contrast, gamma in random order)."""
         if np.random.random() >= self.p_intensity_jitter:
             return volume
         
-        # Random order of transforms
         transforms = ['brightness', 'contrast', 'gamma']
         np.random.shuffle(transforms)
         
@@ -396,34 +392,23 @@ class BYOLTransform(AbstractTransform):
             return volume
         
         sigma = np.random.uniform(*self.blur_sigma_range)
-        # Apply blur to each channel separately, only on spatial dimensions
         for c in range(volume.shape[0]):
             volume[c] = gaussian_filter(volume[c], sigma=sigma)
         
         return volume
     
     def _apply_solarization(self, volume: np.ndarray, p_solar: float) -> np.ndarray:
-        """
-        Apply solarization (intensity inversion above threshold).
-        This is the 3D analog of the 2D solarization in BYOL.
-        
-        For pixels above threshold: x -> 2*threshold - x (reflects around threshold)
-        """
+        """Apply solarization (intensity inversion above threshold)."""
         if np.random.random() >= p_solar:
             return volume
         
-        # Normalize to [0, 1] for threshold comparison
         v_min, v_max = volume.min(), volume.max()
         if v_max - v_min < 1e-8:
             return volume
         
         volume_norm = (volume - v_min) / (v_max - v_min)
-        
-        # Solarize: invert values above threshold
         mask = volume_norm > self.solarization_threshold
         volume_norm[mask] = 2 * self.solarization_threshold - volume_norm[mask]
-        
-        # Denormalize
         volume = volume_norm * (v_max - v_min) + v_min
         
         return volume
@@ -446,17 +431,7 @@ class BYOLTransform(AbstractTransform):
         p_blur: float, 
         p_solar: float
     ) -> np.ndarray:
-        """
-        Apply full augmentation pipeline to a crop.
-        
-        Order follows SimCLR/BYOL:
-        1. Random flip
-        2. Random rotation  
-        3. Intensity jitter
-        4. Gaussian blur (probability depends on view)
-        5. Solarization (probability depends on view)
-        6. Gaussian noise
-        """
+        """Apply full augmentation pipeline to a crop."""
         result = crop.copy()
         
         # Spatial augmentations
@@ -492,15 +467,15 @@ class BYOLTransform(AbstractTransform):
             # View 1: Mandatory blur (p=1.0), NO solarization (p=0.0)
             view1 = self._augment_view(
                 crop1, 
-                p_blur=self.p_blur_view1,      # 1.0
-                p_solar=self.p_solarization_view1  # 0.0
+                p_blur=self.p_blur_view1,
+                p_solar=self.p_solarization_view1
             )
             
             # View 2: Optional blur (p=0.1), optional solarization (p=0.2)
             view2 = self._augment_view(
                 crop2,
-                p_blur=self.p_blur_view2,      # 0.1
-                p_solar=self.p_solarization_view2  # 0.2
+                p_blur=self.p_blur_view2,
+                p_solar=self.p_solarization_view2
             )
             
             view1_list.append(view1)
@@ -543,28 +518,22 @@ class BYOLTrainer(AbstractBaseTrainer):
         projection_dim: int = 256,
         tau_base: float = 0.996,
     ):
-        # Store sizes - crop_size is what the network sees
         self.patch_size = patch_size
         self.crop_size = crop_size
         self.min_overlap_ratio = min_overlap_ratio
         
-        # Set patch size in plan (this is the INPUT patch size for dataloading)
         plan.configurations[configuration_name].patch_size = patch_size
         
-        # Store BYOL params
         self.hidden_dim = hidden_dim
         self.projection_dim = projection_dim
         self.tau_base = tau_base
         
-        # Call parent init
         super().__init__(plan, configuration_name, fold, pretrain_json, device)
         
-        # Training hyperparameters
         self.initial_lr = 3e-4
         self.weight_decay = 1.5e-6
         self.grad_clip = 1.0
         
-        # Step tracking
         self.current_step = 0
         self.max_steps = self.num_epochs * self.num_iterations_per_epoch
         
@@ -590,13 +559,11 @@ class BYOLTrainer(AbstractBaseTrainer):
         
         tr_transforms = []
         
-        # BYOL transform with random crops and asymmetric augmentation
         tr_transforms.append(
             BYOLTransform(
                 patch_size=self.patch_size,
                 crop_size=self.crop_size,
                 min_overlap_ratio=self.min_overlap_ratio,
-                # Shared augmentations
                 p_flip=0.5,
                 p_rotation=0.5,
                 p_intensity_jitter=0.8,
@@ -605,13 +572,11 @@ class BYOLTrainer(AbstractBaseTrainer):
                 gamma_range=(0.7, 1.5),
                 p_noise=0.5,
                 noise_variance=(0, 0.05),
-                # Asymmetric blur
                 blur_sigma_range=(0.5, 2.0),
-                p_blur_view1=1.0,   # Mandatory for view 1
-                p_blur_view2=0.1,   # Optional for view 2
-                # Asymmetric solarization
-                p_solarization_view1=0.0,  # Never for view 1
-                p_solarization_view2=0.2,  # Optional for view 2
+                p_blur_view1=1.0,
+                p_blur_view2=0.1,
+                p_solarization_view1=0.0,
+                p_solarization_view2=0.2,
                 data_key="data",
             )
         )
@@ -621,15 +586,14 @@ class BYOLTrainer(AbstractBaseTrainer):
         return Compose(tr_transforms)
     
     def get_validation_transforms(self) -> AbstractTransform:
-        """Validation with light augmentation (still need different views)."""
+        """Validation with LIGHT augmentation (not zero!)."""
         val_transforms = []
         
         val_transforms.append(
             BYOLTransform(
                 patch_size=self.patch_size,
                 crop_size=self.crop_size,
-                min_overlap_ratio=0.5,  # More overlap for validation stability
-                # Reduced augmentation strength
+                min_overlap_ratio=0.5,
                 p_flip=0.3,
                 p_rotation=0.3,
                 p_intensity_jitter=0.5,
@@ -638,7 +602,6 @@ class BYOLTrainer(AbstractBaseTrainer):
                 gamma_range=(0.9, 1.1),
                 p_noise=0.2,
                 noise_variance=(0, 0.02),
-                # Still asymmetric but reduced
                 blur_sigma_range=(0.5, 1.5),
                 p_blur_view1=1.0,
                 p_blur_view2=0.1,
@@ -654,7 +617,6 @@ class BYOLTrainer(AbstractBaseTrainer):
     
     def get_dataloaders(self):
         """Build dataloaders - loads full patches, transform does cropping."""
-        # Use the full patch_size for loading
         patch_size = self.patch_size
         
         (
@@ -711,14 +673,12 @@ class BYOLTrainer(AbstractBaseTrainer):
     ) -> Tuple[nn.Module, AdaptationPlan]:
         """Build BYOL architecture - network sees crop_size, not patch_size."""
         
-        # IMPORTANT: Create a modified config_plan with crop_size for the network
-        # The network architecture should be built for the CROP size (128³),
-        # not the loading patch size (256³)
+        # Network architecture uses CROP size
         crop_config_plan = deepcopy(config_plan)
         crop_config_plan.patch_size = self.crop_size
         
         encoder = get_network_by_name(
-            crop_config_plan,  # Use crop size for network architecture
+            crop_config_plan,
             "ResEncL",
             num_input_channels,
             num_output_channels,
@@ -737,7 +697,7 @@ class BYOLTrainer(AbstractBaseTrainer):
         adapt_plan = AdaptationPlan(
             architecture_plans=ArchitecturePlans("ResEncL"),
             pretrain_plan=plan,
-            recommended_downstream_patchsize=self.crop_size,  # Downstream uses crop size
+            recommended_downstream_patchsize=self.crop_size,
             pretrain_num_input_channels=1,
             key_to_encoder="online_encoder.stages",
             key_to_stem="online_encoder.stem",
@@ -762,7 +722,6 @@ class BYOLTrainer(AbstractBaseTrainer):
         
         all_views = all_views.to(self.device, non_blocking=True)
         
-        # Split into view1 and view2
         view1 = all_views[:batch_size]
         view2 = all_views[batch_size:]
         
@@ -859,7 +818,7 @@ class BYOLTrainer_BS8(BYOLTrainer):
 
 
 class BYOLTrainer_BS8_256iso(BYOLTrainer):
-    """BYOL for 256³ patches → 128³ crops (your LSFM setup)."""
+    """BYOL for 256³ patches → 128³ crops."""
     def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
         super().__init__(
             plan, configuration_name, fold, pretrain_json, device,
