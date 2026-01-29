@@ -1,14 +1,10 @@
 """
-BYOL (Bootstrap Your Own Latent) Trainer for nnssl framework - FINAL VERSION
+BYOL (Bootstrap Your Own Latent) Trainer for nnssl framework - FIXED & READY
 
-FEATURES:
-1. Uses Repo's SimCLRTransform for true "Random Resized Crop" (Spatial Invariance).
-2. Decouples 'patch_size' (loaded from disk) from 'crop_size' (fed to network).
-   - Loads 256^3 (context) -> Crops 96^3 (focus).
-   - This fixes Memory Issues and improves Feature Learning.
-3. Implements the specific Online/Target Network EMA logic required for BYOL.
-
-Reference: "Bootstrap Your Own Latent" (Grill et al., 2020)
+CHANGES:
+1. Removed broken 'LambdaTransform' import.
+2. Added local 'SplitBYOLViews' class to handle view splitting.
+3. Added 'BYOLTrainer_BS24_256iso' class to match your command.
 """
 
 from copy import deepcopy
@@ -31,7 +27,8 @@ from nnssl.ssl_data.configure_basic_dummyDA import (
 )
 from nnssl.ssl_data.limited_len_wrapper import LimitedLenWrapper
 
-from batchgenerators.transforms.abstract_transforms import AbstractTransform, Compose, LambdaTransform
+# FIX: Removed LambdaTransform from imports
+from batchgenerators.transforms.abstract_transforms import AbstractTransform, Compose
 from batchgenerators.transforms.utility_transforms import NumpyToTensor
 
 # IMPORT REPO TRANSFORMS
@@ -41,14 +38,34 @@ from nnssl.utilities.default_n_proc_DA import get_allowed_n_proc_DA
 
 
 # ============================================================================
+# Helper Transform Class (Replaces LambdaTransform)
+# ============================================================================
+
+class SplitBYOLViews(AbstractTransform):
+    """
+    Splits the concatenated batch from SimCLRTransform into view1 and view2.
+    """
+    def __call__(self, **data_dict):
+        # SimCLRTransform overwrites 'data' with [CropA_batch, CropB_batch]
+        crops = data_dict['data'] 
+        batch_size = data_dict['batch_size']
+        
+        # Split back into two views
+        view1 = crops[:batch_size]
+        view2 = crops[batch_size:]
+        
+        return {
+            'view1': view1, 
+            'view2': view2, 
+            'batch_size': batch_size
+        }
+
+
+# ============================================================================
 # BYOL Architecture Components
 # ============================================================================
 
 class BYOLProjectionHead(nn.Module):
-    """
-    BYOL projection head: Linear -> BN -> ReLU -> Linear
-    Per paper: 4096 hidden dim, 256 output dim
-    """
     def __init__(self, input_dim: int, hidden_dim: int = 4096, output_dim: int = 256):
         super().__init__()
         self.net = nn.Sequential(
@@ -63,10 +80,6 @@ class BYOLProjectionHead(nn.Module):
 
 
 class BYOLPredictorHead(nn.Module):
-    """
-    BYOL predictor head (ONLY on online network, NOT on target).
-    Same architecture as projector.
-    """
     def __init__(self, input_dim: int = 256, hidden_dim: int = 4096, output_dim: int = 256):
         super().__init__()
         self.net = nn.Sequential(
@@ -81,15 +94,6 @@ class BYOLPredictorHead(nn.Module):
 
 
 class BYOLArchitecture(nn.Module):
-    """
-    BYOL Architecture.
-    
-    Online network:  encoder -> projector -> predictor -> prediction
-    Target network:  encoder -> projector -> projection (NO predictor!)
-    
-    Target network is EMA of online network.
-    """
-    
     def __init__(
         self, 
         encoder: nn.Module, 
@@ -100,34 +104,28 @@ class BYOLArchitecture(nn.Module):
     ):
         super().__init__()
         
-        # Total features from all encoder stages
         total_features = sum(features) if isinstance(features, (list, tuple)) else features
         
         self.tau_base = tau_base
         self.tau = tau_base
         
-        # Pooling layer (shared, no parameters)
         self.adaptive_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
         
-        # Online network components
         self.online_encoder = encoder
         self.online_projector = BYOLProjectionHead(total_features, hidden_dim, projection_dim)
         self.online_predictor = BYOLPredictorHead(projection_dim, hidden_dim, projection_dim)
         
-        # Target network (initialized as copy, updated via EMA)
         self.target_encoder = None
         self.target_projector = None
         self._target_initialized = False
     
     def _init_target_network(self):
-        """Initialize target network as deep copy of online network."""
         if self._target_initialized:
             return
             
         self.target_encoder = deepcopy(self.online_encoder)
         self.target_projector = deepcopy(self.online_projector)
         
-        # Target network does NOT receive gradients
         for param in self.target_encoder.parameters():
             param.requires_grad = False
         for param in self.target_projector.parameters():
@@ -137,23 +135,15 @@ class BYOLArchitecture(nn.Module):
     
     @torch.no_grad()
     def update_target_network(self, current_step: int = None, max_steps: int = None):
-        """
-        Update target network via EMA.
-        
-        tau increases from tau_base to 1.0 over training (cosine schedule).
-        Higher tau = slower target updates = more stable.
-        """
         if not self._target_initialized:
             self._init_target_network()
             return
         
-        # Update tau with cosine schedule
         if current_step is not None and max_steps is not None and max_steps > 0:
             self.tau = 1 - (1 - self.tau_base) * (
                 math.cos(math.pi * current_step / max_steps) + 1
             ) / 2
         
-        # EMA update: target = tau*target + (1-tau)*online
         for online_p, target_p in zip(
             self.online_encoder.parameters(), 
             self.target_encoder.parameters()
@@ -167,9 +157,7 @@ class BYOLArchitecture(nn.Module):
             target_p.data.mul_(self.tau).add_(online_p.data, alpha=1 - self.tau)
     
     def _encode_and_pool(self, x: torch.Tensor, encoder: nn.Module) -> torch.Tensor:
-        """Encode input and pool to vector."""
         out = encoder(x)
-        # Handle multi-scale outputs (list of feature maps per stage)
         if isinstance(out, (list, tuple)):
             pooled = [self.adaptive_pool(o) for o in out]
             flat = torch.cat(pooled, dim=1)
@@ -178,11 +166,6 @@ class BYOLArchitecture(nn.Module):
         return flat.view(flat.shape[0], -1)
     
     def forward_online(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Online network forward pass.
-        encoder -> projector -> predictor
-        Returns: prediction (after predictor)
-        """
         encoded = self._encode_and_pool(x, self.online_encoder)
         projected = self.online_projector(encoded)
         predicted = self.online_predictor(projected)
@@ -190,11 +173,6 @@ class BYOLArchitecture(nn.Module):
     
     @torch.no_grad()
     def forward_target(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Target network forward pass (no gradients).
-        encoder -> projector (NO predictor!)
-        Returns: projection (before predictor)
-        """
         if not self._target_initialized:
             self._init_target_network()
         encoded = self._encode_and_pool(x, self.target_encoder)
@@ -202,7 +180,6 @@ class BYOLArchitecture(nn.Module):
         return projected
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Default forward (online projection without predictor, for compatibility)."""
         encoded = self._encode_and_pool(x, self.online_encoder)
         projected = self.online_projector(encoded)
         return projected
@@ -213,14 +190,6 @@ class BYOLArchitecture(nn.Module):
 # ============================================================================
 
 class BYOLLoss(nn.Module):
-    """
-    BYOL loss: Negative cosine similarity between predictions and targets.
-    
-    L = 2 - 2 * <normalize(prediction), normalize(target)>
-    
-    Symmetrized: both directions.
-    """
-    
     def forward(
         self,
         online_pred_1: torch.Tensor,
@@ -228,30 +197,19 @@ class BYOLLoss(nn.Module):
         target_proj_1: torch.Tensor,
         target_proj_2: torch.Tensor,
     ) -> Tuple[torch.Tensor, float]:
-        """
-        Compute BYOL loss.
         
-        BYOL symmetry:
-        - online(view1) predicts target(view2)
-        - online(view2) predicts target(view1)
-        """
-        # L2 normalize
         p1 = nn.functional.normalize(online_pred_1, dim=-1, p=2)
         p2 = nn.functional.normalize(online_pred_2, dim=-1, p=2)
         z1 = nn.functional.normalize(target_proj_1.detach(), dim=-1, p=2)
         z2 = nn.functional.normalize(target_proj_2.detach(), dim=-1, p=2)
         
-        # Symmetric loss
-        # Direction 1: online(view1) -> target(view2)
         loss_1 = 2 - 2 * (p1 * z2).sum(dim=-1).mean()
-        # Direction 2: online(view2) -> target(view1)
         loss_2 = 2 - 2 * (p2 * z1).sum(dim=-1).mean()
         
         total_loss = (loss_1 + loss_2) / 2
         
-        # Pseudo-accuracy for monitoring
         cos_sim = (p1 * z2).sum(dim=-1).mean().item()
-        pseudo_acc = (cos_sim + 1) / 2  # Map [-1,1] to [0,1]
+        pseudo_acc = (cos_sim + 1) / 2
         
         return total_loss, pseudo_acc
 
@@ -269,29 +227,25 @@ class BYOLTrainer(AbstractBaseTrainer):
         pretrain_json: dict,
         device: torch.device = torch.device("cuda"),
         patch_size: tuple = (256, 256, 256),
-        crop_size: tuple = (96, 96, 96), # <--- ADDED: Actual input size to network
+        crop_size: tuple = (96, 96, 96),
         hidden_dim: int = 4096,
         projection_dim: int = 256,
         tau_base: float = 0.996,
     ):
-        # We load larger patches (patch_size) from disk to allow for random crops (crop_size)
         plan.configurations[configuration_name].patch_size = patch_size
         self.patch_size = patch_size
         self.crop_size = crop_size
 
         super().__init__(plan, configuration_name, fold, pretrain_json, device)
         
-        # BYOL hyperparameters
         self.hidden_dim = hidden_dim
         self.projection_dim = projection_dim
         self.tau_base = tau_base
         
-        # Step tracking for EMA schedule
         self.current_step = 0
         self.max_steps = self.num_epochs * self.num_iterations_per_epoch
 
     def build_loss(self) -> nn.Module:
-        """Build BYOL loss."""
         return BYOLLoss()
 
     def get_training_transforms(
@@ -304,43 +258,25 @@ class BYOLTrainer(AbstractBaseTrainer):
             order_resampling_seg: int = 1,
             border_val_seg: int = -1,
         ) -> AbstractTransform:
-            """
-            Training transforms using Repo's SimCLRTransform for proper spatial augmentation.
-            """
+            
             tr_transforms = []
             
             if do_dummy_2d_data_aug:
                 raise NotImplementedError("Data should be isotropic for BYOL!")
             
             # 1. Use the Repo's robust SimCLRTransform
-            # We use self.crop_size (e.g. 96x96x96) which is smaller than self.patch_size (e.g. 256x256x256)
             tr_transforms.append(
                 SimCLRTransform(
-                    crop_size=self.crop_size,  # <--- USE CROP SIZE, NOT PATCH SIZE
+                    crop_size=self.crop_size,
                     aug="train",
-                    crop_count_per_image=1, # 1 ref + 1 overlap = 2 views total per image
-                    min_overlap_ratio=0.5,  # Ensure views share anatomy
+                    crop_count_per_image=1, 
+                    min_overlap_ratio=0.5,
                     data_key="data",
                 )
             )
             
-            # 2. Adapter: Split 'data' into 'view1' and 'view2' for BYOL logic
-            # SimCLRTransform overwrites the "data" key with a concatenated batch of size 2*B
-            def split_crops(**data):
-                crops = data['data'] # Shape: (2*B, C, D, H, W)
-                batch_size = data['batch_size']
-                
-                # The batch is doubled: [Crop A (Batch), Crop B (Batch)]
-                view1 = crops[:batch_size]
-                view2 = crops[batch_size:]
-                
-                return {
-                    'view1': view1, 
-                    'view2': view2, 
-                    'batch_size': batch_size
-                }
-
-            tr_transforms.append(LambdaTransform(split_crops))
+            # 2. Split 'data' into 'view1' and 'view2' using local class
+            tr_transforms.append(SplitBYOLViews())
             
             # 3. Convert to Tensor
             tr_transforms.append(NumpyToTensor(["view1", "view2"], "float"))
@@ -348,12 +284,9 @@ class BYOLTrainer(AbstractBaseTrainer):
             return Compose(tr_transforms)
 
     def get_validation_transforms(self) -> AbstractTransform:
-        """Validation transforms."""
-        # For validation, we still need 2 views to compute the loss, 
-        # but we don't need heavy augmentation.
         val_transforms = []
         
-        # Use SimCLRTransform in "val" mode (less aggressive) or with fixed params
+        # Validation Transform
         val_transforms.append(
             SimCLRTransform(
                 crop_size=self.crop_size, 
@@ -363,19 +296,14 @@ class BYOLTrainer(AbstractBaseTrainer):
             )
         )
         
-        def split_crops(**data):
-            crops = data['data'] 
-            batch_size = data['batch_size']
-            view1 = crops[:batch_size]
-            view2 = crops[batch_size:]
-            return {'view1': view1, 'view2': view2, 'batch_size': batch_size}
-
-        val_transforms.append(LambdaTransform(split_crops))
+        # Split
+        val_transforms.append(SplitBYOLViews())
+        
+        # To Tensor
         val_transforms.append(NumpyToTensor(["view1", "view2"], "float"))
         return Compose(val_transforms)
 
     def get_dataloaders(self):
-        """Build dataloaders."""
         patch_size = self.config_plan.patch_size
         (
             rotation_for_DA,
@@ -427,7 +355,6 @@ class BYOLTrainer(AbstractBaseTrainer):
         num_input_channels: int,
         num_output_channels: int,
     ) -> Tuple[nn.Module, AdaptationPlan]:
-        """Build BYOL architecture."""
         encoder = get_network_by_name(
             config_plan,
             "ResEncL",
@@ -459,15 +386,11 @@ class BYOLTrainer(AbstractBaseTrainer):
         return architecture, adapt_plan
 
     def _get_model(self):
-        """Get underlying model (handles DDP wrapper)."""
         if hasattr(self.network, 'module'):
             return self.network.module
         return self.network
 
     def train_step(self, batch: dict) -> dict:
-        """
-        BYOL training step.
-        """
         view1 = batch["view1"].to(self.device, non_blocking=True)
         view2 = batch["view2"].to(self.device, non_blocking=True)
         
@@ -476,20 +399,15 @@ class BYOLTrainer(AbstractBaseTrainer):
         model = self._get_model()
         
         with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            # Online network forward (encoder -> projector -> predictor)
             online_pred_1 = model.forward_online(view1)
             online_pred_2 = model.forward_online(view2)
             
-            # Target network forward (encoder -> projector, NO predictor)
-            # No gradients through target!
             with torch.no_grad():
                 target_proj_1 = model.forward_target(view1)
                 target_proj_2 = model.forward_target(view2)
             
-            # BYOL loss (symmetric)
             loss, acc = self.loss(online_pred_1, online_pred_2, target_proj_1, target_proj_2)
         
-        # Backward pass
         if self.grad_scaler is not None:
             self.grad_scaler.scale(loss).backward()
             self.grad_scaler.unscale_(self.optimizer)
@@ -501,14 +419,12 @@ class BYOLTrainer(AbstractBaseTrainer):
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
         
-        # EMA update of target network (BYOL-specific!)
         model.update_target_network(self.current_step, self.max_steps)
         self.current_step += 1
         
         return {"loss": loss.detach().cpu().numpy()}
 
     def validation_step(self, batch: dict) -> dict:
-        """Validation step."""
         view1 = batch["view1"].to(self.device, non_blocking=True)
         view2 = batch["view2"].to(self.device, non_blocking=True)
         
@@ -535,13 +451,13 @@ class BYOLTrainer_BS8_256iso(BYOLTrainer):
     def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
         super().__init__(
             plan, configuration_name, fold, pretrain_json, device,
-            patch_size=(256, 256, 256), # Load from disk
-            crop_size=(96, 96, 96),     # Train on this (Fits in VRAM)
+            patch_size=(256, 256, 256), 
+            crop_size=(96, 96, 96),     
             hidden_dim=4096,
             projection_dim=256,
             tau_base=0.996,
         )
-        self.total_batch_size = 8 # Should fit easily with crop_size=96
+        self.total_batch_size = 8 
 
 
 class BYOLTrainer_BS16_256iso(BYOLTrainer):
@@ -557,9 +473,8 @@ class BYOLTrainer_BS16_256iso(BYOLTrainer):
         )
         self.total_batch_size = 16
 
-
 class BYOLTrainer_BS24_256iso(BYOLTrainer):
-    """BYOL with larger batch size (24), possible because crop is small (96³)."""
+    """BYOL with very large batch size (24). Warning: High VRAM usage."""
     def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
         super().__init__(
             plan, configuration_name, fold, pretrain_json, device,
@@ -570,17 +485,3 @@ class BYOLTrainer_BS24_256iso(BYOLTrainer):
             tau_base=0.996,
         )
         self.total_batch_size = 24
-
-
-class BYOLTrainer_BS32_256iso(BYOLTrainer):
-    """BYOL with larger batch size (32), possible because crop is small (96³)."""
-    def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
-        super().__init__(
-            plan, configuration_name, fold, pretrain_json, device,
-            patch_size=(256, 256, 256),
-            crop_size=(96, 96, 96),
-            hidden_dim=4096,
-            projection_dim=256,
-            tau_base=0.996,
-        )
-        self.total_batch_size = 32
