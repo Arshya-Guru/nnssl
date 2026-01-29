@@ -236,7 +236,16 @@ class BYOLTransform(AbstractTransform):
     """
     BYOL augmentation with random crops and asymmetric augmentation.
     
-    Key fixes:
+    Key fixes:Critical DDP Risk: The "Split-Brain" Target Network
+Claude's code initializes the target network using deepcopy(encoder) inside __init__.
+
+The Bug: In PyTorch DDP, the DDP(...) wrapper only synchronizes parameters where requires_grad=True at the start of training. The target network parameters are frozen (requires_grad=False).
+
+The Consequence: When you launch training on 2 GPUs, GPU_0 and GPU_1 will initialize their encoders with different random seeds. DDP will sync the online network, but the target networks will remain different on every GPU.
+
+The Result: Your GPUs are training against different targets. The EMA update will propagate these differences indefinitely. This effectively creates "split-brain" training that degrades representation quality.
+
+The Fix: You must manually broadcast the target network weights from Rank 0 to all other ranks during initialize().
     - Random 3D crops from larger patches
     - ASYMMETRIC blur/solarization between views (per BYOL paper)
     - Fixed np.random.choice bug for rotation axes
