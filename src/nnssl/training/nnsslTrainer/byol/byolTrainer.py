@@ -1,22 +1,12 @@
 """
-BYOL (Bootstrap Your Own Latent) Trainer for nnssl framework - CORRECTED VERSION
+BYOL (Bootstrap Your Own Latent) Trainer for nnssl framework - FINAL VERSION
 
-KEY INSIGHT: BYOL requires TWO AUGMENTED VIEWS OF THE SAME CONTENT.
-This is different from SimCLR which uses overlapping crops at different positions.
-
-The original BYOL paper:
-"From an augmented view of an image, we train the online network to predict 
-the target network representation of the same image under a DIFFERENT AUGMENTED VIEW"
-
-So we need:
-- Same patch/image
-- Two DIFFERENT random augmentations applied
-- NOT two crops from different spatial positions
-
-This implementation:
-1. Uses a BYOLTransform that creates two augmented views of the FULL patch
-2. Follows true BYOL architecture (online+target, EMA updates)
-3. Uses BYOL loss (prediction, no negatives)
+FEATURES:
+1. Uses Repo's SimCLRTransform for true "Random Resized Crop" (Spatial Invariance).
+2. Decouples 'patch_size' (loaded from disk) from 'crop_size' (fed to network).
+   - Loads 256^3 (context) -> Crops 96^3 (focus).
+   - This fixes Memory Issues and improves Feature Learning.
+3. Implements the specific Online/Target Network EMA logic required for BYOL.
 
 Reference: "Bootstrap Your Own Latent" (Grill et al., 2020)
 """
@@ -28,11 +18,7 @@ import math
 import numpy as np
 import torch
 from torch import nn
-from torch.optim.adamw import AdamW
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
-from einops import rearrange
-
-from pl_bolts.optimizers.lr_scheduler import LinearWarmupCosineAnnealingLR
 
 from torch import autocast
 from nnssl.adaptation_planning.adaptation_plan import AdaptationPlan, ArchitecturePlans
@@ -45,146 +31,13 @@ from nnssl.ssl_data.configure_basic_dummyDA import (
 )
 from nnssl.ssl_data.limited_len_wrapper import LimitedLenWrapper
 
-from batchgenerators.transforms.abstract_transforms import AbstractTransform, Compose
+from batchgenerators.transforms.abstract_transforms import AbstractTransform, Compose, LambdaTransform
 from batchgenerators.transforms.utility_transforms import NumpyToTensor
 
+# IMPORT REPO TRANSFORMS
+from nnssl.ssl_data.dataloading.simclr_transform import SimCLRTransform
 from nnssl.training.nnsslTrainer.AbstractTrainer import AbstractBaseTrainer
 from nnssl.utilities.default_n_proc_DA import get_allowed_n_proc_DA
-
-
-# ============================================================================
-# BYOL Transform - Creates TWO AUGMENTED VIEWS of the SAME patch
-# ============================================================================
-
-class BYOLTransform(AbstractTransform):
-    """
-    BYOL-specific transform: Creates two differently-augmented views of the SAME patch.
-    
-    This is DIFFERENT from SimCLRTransform which creates overlapping crops at 
-    different spatial positions. BYOL requires augmentation diversity, not spatial diversity.
-    
-    Output:
-        view1: (B, C, D, H, W) - first augmented view
-        view2: (B, C, D, H, W) - second augmented view (same content, different augmentation)
-    """
-    
-    def __init__(
-        self,
-        patch_size: Tuple[int, int, int],
-        data_key: str = "data",
-        # Augmentation probabilities
-        p_flip: float = 0.5,
-        p_rot90: float = 0.5,
-        p_noise: float = 0.15,
-        p_brightness: float = 0.15,
-        p_contrast: float = 0.15,
-        p_gamma: float = 0.15,
-        # Augmentation ranges
-        noise_variance: Tuple[float, float] = (0.0, 0.1),
-        brightness_range: Tuple[float, float] = (0.75, 1.25),
-        contrast_range: Tuple[float, float] = (0.75, 1.25),
-        gamma_range: Tuple[float, float] = (0.7, 1.5),
-    ):
-        self.patch_size = patch_size
-        self.data_key = data_key
-        
-        # Augmentation config
-        self.p_flip = p_flip
-        self.p_rot90 = p_rot90
-        self.p_noise = p_noise
-        self.p_brightness = p_brightness
-        self.p_contrast = p_contrast
-        self.p_gamma = p_gamma
-        
-        self.noise_variance = noise_variance
-        self.brightness_range = brightness_range
-        self.contrast_range = contrast_range
-        self.gamma_range = gamma_range
-    
-    def _augment_single(self, data: np.ndarray) -> np.ndarray:
-        """
-        Apply random augmentations to a single volume.
-        Each call produces a DIFFERENT random augmentation.
-        
-        Args:
-            data: (C, D, H, W) volume
-        Returns:
-            augmented: (C, D, H, W) augmented volume
-        """
-        # Make a copy to avoid modifying original
-        data = data.copy()
-        
-        # Random flips (independent for each axis)
-        if np.random.random() < self.p_flip:
-            axis = np.random.choice([1, 2, 3])  # D, H, or W axis
-            data = np.flip(data, axis=axis).copy()
-        
-        # Random 90-degree rotations
-        if np.random.random() < self.p_rot90:
-            k = np.random.randint(1, 4)  # 90, 180, or 270 degrees
-            axes = [(1, 2), (1, 3), (2, 3)]  # rotation planes
-            ax = axes[np.random.randint(0, 3)]
-            data = np.rot90(data, k=k, axes=ax).copy()
-        
-        # Gaussian noise
-        if np.random.random() < self.p_noise:
-            variance = np.random.uniform(*self.noise_variance)
-            noise = np.random.normal(0, np.sqrt(variance), data.shape).astype(np.float32)
-            data = data + noise
-        
-        # Brightness (multiplicative)
-        if np.random.random() < self.p_brightness:
-            factor = np.random.uniform(*self.brightness_range)
-            data = data * factor
-        
-        # Contrast
-        if np.random.random() < self.p_contrast:
-            factor = np.random.uniform(*self.contrast_range)
-            mean = data.mean()
-            data = (data - mean) * factor + mean
-        
-        # Gamma correction
-        if np.random.random() < self.p_gamma:
-            gamma = np.random.uniform(*self.gamma_range)
-            data_min = data.min()
-            data_range = data.max() - data_min
-            if data_range > 1e-8:
-                data = np.power((data - data_min) / data_range + 1e-8, gamma) * data_range + data_min
-        
-        return data.astype(np.float32)
-    
-    def __call__(self, **data_dict) -> dict:
-        """
-        Create two augmented views of each sample in the batch.
-        
-        Input: {"data": (B, C, D, H, W)}
-        Output: {"view1": (B, C, D, H, W), "view2": (B, C, D, H, W), "batch_size": B}
-        """
-        data = data_dict[self.data_key]  # (B, C, D, H, W)
-        batch_size = data.shape[0]
-        
-        view1_list = []
-        view2_list = []
-        
-        for b in range(batch_size):
-            sample = data[b]  # (C, D, H, W)
-            
-            # Create TWO DIFFERENT augmented views of the SAME patch
-            # This is the key difference from SimCLR!
-            v1 = self._augment_single(sample)
-            v2 = self._augment_single(sample)  # Different random augmentation!
-            
-            view1_list.append(v1)
-            view2_list.append(v2)
-        
-        view1 = np.stack(view1_list, axis=0)  # (B, C, D, H, W)
-        view2 = np.stack(view2_list, axis=0)  # (B, C, D, H, W)
-        
-        return {
-            "view1": view1,
-            "view2": view2,
-            "batch_size": batch_size,
-        }
 
 
 # ============================================================================
@@ -193,7 +46,7 @@ class BYOLTransform(AbstractTransform):
 
 class BYOLProjectionHead(nn.Module):
     """
-    BYOL projection head: Linear → BN → ReLU → Linear
+    BYOL projection head: Linear -> BN -> ReLU -> Linear
     Per paper: 4096 hidden dim, 256 output dim
     """
     def __init__(self, input_dim: int, hidden_dim: int = 4096, output_dim: int = 256):
@@ -231,8 +84,8 @@ class BYOLArchitecture(nn.Module):
     """
     BYOL Architecture.
     
-    Online network:  encoder → projector → predictor → prediction
-    Target network:  encoder → projector → projection (NO predictor!)
+    Online network:  encoder -> projector -> predictor -> prediction
+    Target network:  encoder -> projector -> projection (NO predictor!)
     
     Target network is EMA of online network.
     """
@@ -287,8 +140,8 @@ class BYOLArchitecture(nn.Module):
         """
         Update target network via EMA.
         
-        τ increases from τ_base to 1.0 over training (cosine schedule).
-        Higher τ = slower target updates = more stable.
+        tau increases from tau_base to 1.0 over training (cosine schedule).
+        Higher tau = slower target updates = more stable.
         """
         if not self._target_initialized:
             self._init_target_network()
@@ -300,7 +153,7 @@ class BYOLArchitecture(nn.Module):
                 math.cos(math.pi * current_step / max_steps) + 1
             ) / 2
         
-        # EMA update: target = τ*target + (1-τ)*online
+        # EMA update: target = tau*target + (1-tau)*online
         for online_p, target_p in zip(
             self.online_encoder.parameters(), 
             self.target_encoder.parameters()
@@ -327,7 +180,7 @@ class BYOLArchitecture(nn.Module):
     def forward_online(self, x: torch.Tensor) -> torch.Tensor:
         """
         Online network forward pass.
-        encoder → projector → predictor
+        encoder -> projector -> predictor
         Returns: prediction (after predictor)
         """
         encoded = self._encode_and_pool(x, self.online_encoder)
@@ -339,7 +192,7 @@ class BYOLArchitecture(nn.Module):
     def forward_target(self, x: torch.Tensor) -> torch.Tensor:
         """
         Target network forward pass (no gradients).
-        encoder → projector (NO predictor!)
+        encoder -> projector (NO predictor!)
         Returns: projection (before predictor)
         """
         if not self._target_initialized:
@@ -389,9 +242,9 @@ class BYOLLoss(nn.Module):
         z2 = nn.functional.normalize(target_proj_2.detach(), dim=-1, p=2)
         
         # Symmetric loss
-        # Direction 1: online(view1) → target(view2)
+        # Direction 1: online(view1) -> target(view2)
         loss_1 = 2 - 2 * (p1 * z2).sum(dim=-1).mean()
-        # Direction 2: online(view2) → target(view1)
+        # Direction 2: online(view2) -> target(view1)
         loss_2 = 2 - 2 * (p2 * z1).sum(dim=-1).mean()
         
         total_loss = (loss_1 + loss_2) / 2
@@ -408,14 +261,6 @@ class BYOLLoss(nn.Module):
 # ============================================================================
 
 class BYOLTrainer(AbstractBaseTrainer):
-    """
-    BYOL Trainer with CORRECT dual-view augmentation.
-    
-    Key difference from SimCLR:
-    - Uses BYOLTransform: two augmented views of SAME patch
-    - NOT SimCLRTransform: overlapping crops at different positions
-    """
-
     def __init__(
         self,
         plan: Plan,
@@ -424,12 +269,15 @@ class BYOLTrainer(AbstractBaseTrainer):
         pretrain_json: dict,
         device: torch.device = torch.device("cuda"),
         patch_size: tuple = (256, 256, 256),
+        crop_size: tuple = (96, 96, 96), # <--- ADDED: Actual input size to network
         hidden_dim: int = 4096,
         projection_dim: int = 256,
         tau_base: float = 0.996,
     ):
+        # We load larger patches (patch_size) from disk to allow for random crops (crop_size)
         plan.configurations[configuration_name].patch_size = patch_size
         self.patch_size = patch_size
+        self.crop_size = crop_size
 
         super().__init__(plan, configuration_name, fold, pretrain_json, device)
         
@@ -465,11 +313,10 @@ class BYOLTrainer(AbstractBaseTrainer):
                 raise NotImplementedError("Data should be isotropic for BYOL!")
             
             # 1. Use the Repo's robust SimCLRTransform
-            # This generates 2 views: 1 reference + 1 overlapping crop
-            # Result is stored in 'all_crops' with shape (2*B, C, D, H, W)
+            # We use self.crop_size (e.g. 96x96x96) which is smaller than self.patch_size (e.g. 256x256x256)
             tr_transforms.append(
                 SimCLRTransform(
-                    crop_size=self.patch_size, 
+                    crop_size=self.crop_size,  # <--- USE CROP SIZE, NOT PATCH SIZE
                     aug="train",
                     crop_count_per_image=1, # 1 ref + 1 overlap = 2 views total per image
                     min_overlap_ratio=0.5,  # Ensure views share anatomy
@@ -477,13 +324,13 @@ class BYOLTrainer(AbstractBaseTrainer):
                 )
             )
             
-            # 2. Adapter: Split 'all_crops' into 'view1' and 'view2' for BYOL logic
+            # 2. Adapter: Split 'data' into 'view1' and 'view2' for BYOL logic
+            # SimCLRTransform overwrites the "data" key with a concatenated batch of size 2*B
             def split_crops(**data):
-                crops = data['all_crops'] # Shape: (2*B, C, D, H, W)
+                crops = data['data'] # Shape: (2*B, C, D, H, W)
                 batch_size = data['batch_size']
                 
-                # SimCLRTransform concatenates [reference_crops, overlapping_crops]
-                # So the first half is View 1, the second half is View 2
+                # The batch is doubled: [Crop A (Batch), Crop B (Batch)]
                 view1 = crops[:batch_size]
                 view2 = crops[batch_size:]
                 
@@ -501,23 +348,29 @@ class BYOLTrainer(AbstractBaseTrainer):
             return Compose(tr_transforms)
 
     def get_validation_transforms(self) -> AbstractTransform:
-        """Validation transforms (minimal augmentation)."""
+        """Validation transforms."""
+        # For validation, we still need 2 views to compute the loss, 
+        # but we don't need heavy augmentation.
         val_transforms = []
         
+        # Use SimCLRTransform in "val" mode (less aggressive) or with fixed params
         val_transforms.append(
-            BYOLTransform(
-                patch_size=self.patch_size,
+            SimCLRTransform(
+                crop_size=self.crop_size, 
+                aug="val", 
+                crop_count_per_image=1,
                 data_key="data",
-                # No augmentation for validation
-                p_flip=0.0,
-                p_rot90=0.0,
-                p_noise=0.0,
-                p_brightness=0.0,
-                p_contrast=0.0,
-                p_gamma=0.0,
             )
         )
         
+        def split_crops(**data):
+            crops = data['data'] 
+            batch_size = data['batch_size']
+            view1 = crops[:batch_size]
+            view2 = crops[batch_size:]
+            return {'view1': view1, 'view2': view2, 'batch_size': batch_size}
+
+        val_transforms.append(LambdaTransform(split_crops))
         val_transforms.append(NumpyToTensor(["view1", "view2"], "float"))
         return Compose(val_transforms)
 
@@ -614,14 +467,6 @@ class BYOLTrainer(AbstractBaseTrainer):
     def train_step(self, batch: dict) -> dict:
         """
         BYOL training step.
-        
-        Batch contains:
-        - view1: (B, C, D, H, W) - first augmented view of each patch
-        - view2: (B, C, D, H, W) - second augmented view of SAME patch
-        
-        BYOL forward:
-        - online(view1) predicts target(view2)
-        - online(view2) predicts target(view1)
         """
         view1 = batch["view1"].to(self.device, non_blocking=True)
         view2 = batch["view2"].to(self.device, non_blocking=True)
@@ -631,11 +476,11 @@ class BYOLTrainer(AbstractBaseTrainer):
         model = self._get_model()
         
         with autocast(self.device.type, enabled=True) if self.device.type == "cuda" else dummy_context():
-            # Online network forward (encoder → projector → predictor)
+            # Online network forward (encoder -> projector -> predictor)
             online_pred_1 = model.forward_online(view1)
             online_pred_2 = model.forward_online(view2)
             
-            # Target network forward (encoder → projector, NO predictor)
+            # Target network forward (encoder -> projector, NO predictor)
             # No gradients through target!
             with torch.no_grad():
                 target_proj_1 = model.forward_target(view1)
@@ -682,57 +527,60 @@ class BYOLTrainer(AbstractBaseTrainer):
 
 
 # ============================================================================
-# Trainer Variants
+# Trainer Variants - DEFINED WITH CROP SIZES
 # ============================================================================
 
-class BYOLTrainer_BS8(BYOLTrainer):
-    """BYOL with batch size 8."""
-    def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
-        super().__init__(plan, configuration_name, fold, pretrain_json, device)
-        self.total_batch_size = 8
-
-
-class BYOLTrainer_BS4(BYOLTrainer):
-    """BYOL with batch size 4."""
-    def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
-        super().__init__(plan, configuration_name, fold, pretrain_json, device)
-        self.total_batch_size = 4
-
-
 class BYOLTrainer_BS8_256iso(BYOLTrainer):
-    """BYOL for 256³ isotropic LSFM data."""
+    """BYOL for 256³ data, cropping to 96³."""
+    def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
+        super().__init__(
+            plan, configuration_name, fold, pretrain_json, device,
+            patch_size=(256, 256, 256), # Load from disk
+            crop_size=(96, 96, 96),     # Train on this (Fits in VRAM)
+            hidden_dim=4096,
+            projection_dim=256,
+            tau_base=0.996,
+        )
+        self.total_batch_size = 8 # Should fit easily with crop_size=96
+
+
+class BYOLTrainer_BS16_256iso(BYOLTrainer):
+    """BYOL with larger batch size (16), possible because crop is small (96³)."""
     def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
         super().__init__(
             plan, configuration_name, fold, pretrain_json, device,
             patch_size=(256, 256, 256),
+            crop_size=(96, 96, 96),
             hidden_dim=4096,
             projection_dim=256,
             tau_base=0.996,
         )
-        self.total_batch_size = 8
+        self.total_batch_size = 16
 
 
-class BYOLTrainer_BS4_256iso(BYOLTrainer):
-    """BYOL for 256³ isotropic data, smaller batch."""
+class BYOLTrainer_BS24_256iso(BYOLTrainer):
+    """BYOL with larger batch size (24), possible because crop is small (96³)."""
     def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
         super().__init__(
             plan, configuration_name, fold, pretrain_json, device,
             patch_size=(256, 256, 256),
+            crop_size=(96, 96, 96),
             hidden_dim=4096,
             projection_dim=256,
             tau_base=0.996,
         )
-        self.total_batch_size = 4
+        self.total_batch_size = 24
 
 
-class BYOLTrainer_BS8_128iso(BYOLTrainer):
-    """BYOL for 128³ isotropic data."""
+class BYOLTrainer_BS32_256iso(BYOLTrainer):
+    """BYOL with larger batch size (32), possible because crop is small (96³)."""
     def __init__(self, plan, configuration_name, fold, pretrain_json, device=torch.device("cuda")):
         super().__init__(
             plan, configuration_name, fold, pretrain_json, device,
-            patch_size=(128, 128, 128),
+            patch_size=(256, 256, 256),
+            crop_size=(96, 96, 96),
             hidden_dim=4096,
             projection_dim=256,
             tau_base=0.996,
         )
-        self.total_batch_size = 8
+        self.total_batch_size = 32
