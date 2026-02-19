@@ -9,3 +9,5 @@ version = "0.1.0"
 [dependencies]
 python = "3.12.*"
 pip = ">=25.3,<26"
+batchgenerators = ">=0.25.1,<0.26"
+simpleitk = ">=2.5.3,<3"
